@@ -10,7 +10,6 @@ try:
 except Exception:
     pass  # 이미 다른 곳에서 설정된 경우(추후 app.py에 편입 시) 조용히 넘어간다.
 
-import folium
 from streamlit_folium import st_folium
 
 # "features.4"는 폴더명이 숫자로 시작해 파이썬 패키지 경로로 import할 수 없다.
@@ -39,7 +38,7 @@ def _find_alert_by_click(lat: float, lng: float, alerts: list) -> "service.Alert
 
 def render_map_view() -> None:
     """한반도 위성사진 + 경보 마커 지도를 그린다. 마커를 누르면 상세 화면으로 전환한다."""
-    st.title("한반도 EO 위성 데이터")
+    st.title("지휘관 페이지")
 
     try:
         m = service.build_eo_map()
@@ -57,11 +56,11 @@ def render_map_view() -> None:
 
     for alert in alerts:
         level_label = service.marker_label(alert.alert_level)
-        folium.Marker(
-            location=[alert.latitude, alert.longitude],
+        service.add_circle_marker(
+            m, alert.latitude, alert.longitude,
+            color=service.marker_color(alert.alert_level),
             tooltip=f"[{level_label}] {alert.asset_name}",
-            icon=folium.Icon(color=service.marker_color(alert.alert_level), icon='info-sign'),
-        ).add_to(m)
+        )
 
     st.caption("마커 색상: 🔴 긴급 · 🟠 중요 · 🔵 특이 (마커를 누르면 상세 화면으로 이동)")
 

@@ -9,12 +9,14 @@ alert_id로 조회되는 경보 세션(위치정보·적군자산·경보수준 
   image_analysis.region_id -> region.region_id   (위도·경도는 region 테이블에 있다)
   change_event.equipment_id -> equipment.equipment_id (적군자산 이름)
 
-위성사진은 image_analysis.original_image_path/result_image_path에 아직 실제 경로가
-채워져 있지 않아, 우선 프로젝트 루트의 result_image/ 폴더에 있는 사진을 대신 사용한다.
-파일명 끝의 HHMMSS(예: 100000 -> 10:00:00)를 촬영 시각으로 보고 시간순 정렬한다.
+위성사진은 alert.change_id -> change_event.current_image_id -> image_analysis 순서로
+조인해서, 같은 지역(region_id)에서 촬영된 최근 사진들 중 result_image_path가 채워진
+것만 최신 3장(H-4/H-2/H-Hour) 골라 온다. 혹시 DB에 아직 연결이 안 되어 있으면
+(구버전 seed 데이터 등) 프로젝트 루트 result_image/ 폴더를 훑는 방식으로 대신한다.
+파일명 끝의 HHMMSS(예: 100000 -> 10:00:00)를 촬영 시각 라벨로 쓴다.
 
 지도(EO 위성 배경) 생성 로직은 view.py·detail_view.py가 똑같이 쓰므로 build_eo_map()
-하나로 공용화했다. 아군 자산은 아직 DB에 friendly_asset류 테이블이 없어 목업으로 둔다.
+하나로 공용화했다. 아군 자산(아군 타격 자산)은 strike_asset 테이블에서 조회한다.
 """
 import re
 from dataclasses import dataclass
@@ -46,9 +48,11 @@ DEFAULT_MARKER_COLOR = "gray"  # 알 수 없는 경보수준이 들어와도 지
 # (예: alert 테이블에 행이 16개 있어도 그중 가장 최신 1개만 가져온다.)
 MAX_ALERTS_ON_MAP = 1
 
-# 위성사진이 들어있는 폴더 (프로젝트 루트 바로 아래 result_image/).
-# 지금은 alert_id별로 나뉘어 있지 않고, 이 폴더 안 사진을 공통으로 보여준다.
-IMAGE_ROOT_DIR = Path(__file__).resolve().parents[2] / "result_image"
+# 프로젝트 루트 (result_image_path 같은 DB의 상대경로를 실제 파일로 바꿀 때 기준 폴더).
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# DB 연결이 안 된 구버전 alert를 위한 대체용 폴더 스캔 (프로젝트 루트 바로 아래 result_image/).
+IMAGE_ROOT_DIR = PROJECT_ROOT / "result_image"
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
 MAX_IMAGES_PER_ALERT = 3
 
@@ -76,7 +80,7 @@ def image_time_label(path: Path) -> str:
 _ALERT_QUERY = f"""
     SELECT
         a.alert_id, a.alert_level, a.title, a.message,
-        eq.class_name,
+        eq.class_name, eq.category AS eq_category, eq.threat_level, eq.description AS eq_description,
         r.region_name, r.latitude, r.longitude
     FROM `{_DB}`.`alert` a
     JOIN `{_DB}`.`change_event` ce ON a.change_id = ce.change_id
@@ -93,7 +97,10 @@ class Alert:
     latitude: float
     longitude: float
     alert_level: str       # DB enum 원본값 (URGENT/IMPORTANT/NOTICE)
-    asset_name: str = ""   # 적군자산(장비) 이름
+    asset_name: str = ""   # 적군자산(장비) 이름 (equipment.class_name)
+    asset_category: str = ""       # 적군자산 종류 (equipment.category)
+    asset_threat_level: Optional[int] = None  # 적군자산 위협도 (equipment.threat_level)
+    asset_description: str = ""    # 적군자산 설명 (equipment.description)
     title: str = ""        # 경보제목
     summary: str = ""      # 변화요약(경보 발생 근거)
     region: str = ""       # 지역
@@ -107,6 +114,9 @@ def _row_to_alert(row) -> Alert:
         longitude=float(m["longitude"]),
         alert_level=m["alert_level"],
         asset_name=m["class_name"] or "",
+        asset_category=m["eq_category"] or "",
+        asset_threat_level=m["threat_level"],
+        asset_description=m["eq_description"] or "",
         title=m["title"] or "",
         summary=m["message"] or "",
         region=m["region_name"] or "",
@@ -133,13 +143,26 @@ def get_alert_by_id(alert_id: int) -> Optional[Alert]:
     return _row_to_alert(row) if row else None
 
 
-def get_alert_images(alert_id: int) -> List[Path]:
-    """result_image/ 폴더의 위성사진을 촬영 시각(파일명 끝 HHMMSS)순으로 최대 3장 찾는다.
+# alert -> change_event -> (current_image의) region_id로, 같은 지역에서 촬영된
+# 사진들 중 result_image_path가 채워진 것만, current_image 시각 이전(포함)으로 최신
+# 3장을 가져온다. 2시간 간격 촬영이므로 이 3장이 각각 H-4/H-2/H-Hour에 해당한다.
+_ALERT_IMAGES_QUERY = f"""
+    SELECT ia2.result_image_path, ia2.original_image_path, ia2.captured_time
+    FROM `{_DB}`.`alert` a
+    JOIN `{_DB}`.`change_event` ce ON a.change_id = ce.change_id
+    JOIN `{_DB}`.`image_analysis` ia ON ce.current_image_id = ia.image_id
+    JOIN `{_DB}`.`image_analysis` ia2 ON ia2.region_id = ia.region_id
+    WHERE a.alert_id = :alert_id
+      AND ia2.captured_time <= ia.captured_time
+      AND ia2.result_image_path IS NOT NULL
+      AND ia2.result_image_path <> ''
+    ORDER BY ia2.captured_time DESC
+    LIMIT {MAX_IMAGES_PER_ALERT}
+"""
 
-    실제 위성사진 경로(image_analysis.original_image_path)는 아직 DB에 채워져 있지
-    않고, alert_id별 폴더 구분도 없어서 지금은 이 공용 폴더를 그대로 사용한다.
-    (alert_id는 나중에 alert별 폴더가 생기면 쓸 수 있도록 인자만 남겨둔다.)
-    """
+
+def _scan_image_root_dir() -> List[Path]:
+    """(대체용) result_image/ 폴더를 훑어 파일명 끝 HHMMSS 순으로 최대 3장 찾는다."""
     if not IMAGE_ROOT_DIR.is_dir():
         return []
     images = sorted(
@@ -150,6 +173,31 @@ def get_alert_images(alert_id: int) -> List[Path]:
     return images[:MAX_IMAGES_PER_ALERT]
 
 
+def get_alert_images(alert_id: int) -> List[Path]:
+    """alert -> change_event -> image_analysis로 조인해 result_image_path를 가져온다.
+
+    DB에서 못 찾으면(과거 seed 데이터처럼 change_event가 아직 실제 사진에 연결
+    안 된 경우) result_image/ 폴더를 훑는 방식으로 대신한다.
+    """
+    with get_engine().connect() as conn:
+        rows = conn.execute(
+            text(_ALERT_IMAGES_QUERY),
+            {"alert_id": alert_id},
+        ).fetchall()
+
+    images: List[Path] = []
+    for row in reversed(rows):  # DESC로 가져왔으니 오래된 순으로 다시 뒤집는다.
+        m = dict(row._mapping)
+        rel_path = m["result_image_path"] or m["original_image_path"]
+        if not rel_path:
+            continue
+        full_path = PROJECT_ROOT / rel_path
+        if full_path.is_file():
+            images.append(full_path)
+
+    return images[:MAX_IMAGES_PER_ALERT] if images else _scan_image_root_dir()
+
+
 def marker_color(alert_level: str) -> str:
     """경보수준(enum) 문자열을 folium 마커 색상 이름으로 바꾼다."""
     return ALERT_LEVEL_COLORS.get(alert_level, DEFAULT_MARKER_COLOR)
@@ -158,6 +206,25 @@ def marker_color(alert_level: str) -> str:
 def marker_label(alert_level: str) -> str:
     """경보수준(enum) 문자열을 화면 표시용 한글(긴급/중요/특이)로 바꾼다."""
     return ALERT_LEVEL_LABELS.get(alert_level, alert_level)
+
+
+# 지도를 한반도 전체가 보이도록 축소하고 나니, 기본 Leaflet 핀 마커(folium.Icon)가
+# 화면 대비 너무 커 보여서 작은 원형 마커(CircleMarker)로 통일한다.
+MARKER_RADIUS_PX = 8
+
+
+def add_circle_marker(map_obj: folium.Map, latitude: float, longitude: float, color: str, tooltip: str) -> None:
+    """작은 원형 마커 하나를 지도에 추가한다 (경보 지도·아군 자산 지도 공용)."""
+    folium.CircleMarker(
+        location=[latitude, longitude],
+        radius=MARKER_RADIUS_PX,
+        color="white",
+        weight=1.5,
+        fill=True,
+        fill_color=color,
+        fill_opacity=0.9,
+        tooltip=tooltip,
+    ).add_to(map_obj)
 
 
 # =====================================================================
@@ -179,8 +246,14 @@ def _add_ee_layer(self, ee_image_object, vis_params, name):
 folium.Map.add_ee_layer = _add_ee_layer
 
 
-def build_eo_map(location=(36.5, 127.5), zoom_start: int = 7) -> folium.Map:
-    """한반도 Sentinel-2 EO 레이어가 깔린 기본 지도를 만든다 (지도·상세 화면 공용)."""
+# 초기 화면에 한반도 전체(남한+북한)가 다 보이도록 고정하는 범위.
+# 우리 시스템은 북한 동향(신의주·나선 등 북쪽 지역 포함)이 중요해서, 남한 위주로
+# 잘려 보이지 않게 fit_bounds로 위/아래 범위를 강제한다.
+_KOREA_PENINSULA_BOUNDS = [[33.0, 124.0], [43.2, 131.0]]  # [남서(제주 아래)], [북동(나선/신의주 위)]
+
+
+def build_eo_map(location=(38.0, 127.5), zoom_start: int = 6) -> folium.Map:
+    """한반도(남한+북한 전체) Sentinel-2 EO 레이어가 깔린 기본 지도를 만든다 (지도·상세 화면 공용)."""
     # GEE 초기화 (인증 안 되어있으면 터미널에 링크 뜸)
     try:
         ee.Initialize(project='project-501908')
@@ -189,6 +262,9 @@ def build_eo_map(location=(36.5, 127.5), zoom_start: int = 7) -> folium.Map:
         ee.Initialize(project='project-501908')
 
     m = folium.Map(location=list(location), zoom_start=zoom_start)
+    # zoom_start만으로는 화면 비율에 따라 북한 위쪽이 잘려 보일 수 있어서,
+    # 한반도 전체 범위를 명시적으로 고정한다.
+    m.fit_bounds(_KOREA_PENINSULA_BOUNDS)
 
     dataset = ee.ImageCollection('COPERNICUS/S2_SR') \
                   .filterBounds(ee.Geometry.Point([location[1], location[0]])) \
@@ -197,32 +273,54 @@ def build_eo_map(location=(36.5, 127.5), zoom_start: int = 7) -> folium.Map:
                   .median()
     vis_params = {'bands': ['B4', 'B3', 'B2'], 'min': 0, 'max': 3000}
     m.add_ee_layer(dataset, vis_params, 'Sentinel-2 (True Color)')
-    folium.LayerControl(collapsed=False).add_to(m)
     return m
 
 
 # =====================================================================
-# 아군 자산 (목업) - DB에 friendly_asset류 테이블이 아직 없어 임시로 둔다.
-# 나중에 실제 테이블이 생기면 get_mock_friendly_assets()만 DB 조회로 바꾸면 된다.
+# 아군 자산 (strike_asset 테이블 - 타격 자산 목록)
 # =====================================================================
 
 FRIENDLY_MARKER_COLOR = "cadetblue"
 FRIENDLY_MARKER_ICON = "flag"
 
+_STRIKE_ASSET_QUERY = f"""
+    SELECT asset_name, name, category, range_km, response_time_min,
+           notes, location_name, latitude, longitude
+    FROM `{_DB}`.`strike_asset`
+"""
+
 
 @dataclass
 class FriendlyAsset:
-    """아군 자산 하나 (이름·종류·위치)."""
-    name: str
-    asset_type: str
-    latitude: float
-    longitude: float
+    """아군 타격 자산 하나 (부대명·자산명·종류·사거리·대응시간·위치)."""
+    asset_name: str          # 부대명 (예: 제11전투비행단)
+    name: str                # 자산명 (예: F-15K)
+    category: str            # 자산 종류 (예: 항공전력)
+    range_km: float
+    response_time_min: int
+    notes: str = ""
+    location_name: str = ""
+    latitude: float = 0.0
+    longitude: float = 0.0
 
 
-def get_mock_friendly_assets() -> List[FriendlyAsset]:
-    """아군 자산 목업 목록. 실제 friendly_asset 테이블이 생기면 DB 조회로 교체한다."""
-    return [
-        FriendlyAsset("제1군단 사령부", "지휘소", 37.90, 127.20),
-        FriendlyAsset("아군 기갑여단", "기갑부대", 38.05, 127.05),
-        FriendlyAsset("해군 2함대", "함대", 36.95, 126.60),
-    ]
+def _row_to_friendly_asset(row) -> FriendlyAsset:
+    m = dict(row._mapping)
+    return FriendlyAsset(
+        asset_name=m["asset_name"],
+        name=m["name"],
+        category=m["category"],
+        range_km=float(m["range_km"]),
+        response_time_min=int(m["response_time_min"]),
+        notes=m["notes"] or "",
+        location_name=m["location_name"] or "",
+        latitude=float(m["latitude"]),
+        longitude=float(m["longitude"]),
+    )
+
+
+def get_strike_assets() -> List[FriendlyAsset]:
+    """실제 strike_asset 테이블에서 아군 타격 자산 목록을 조회한다."""
+    with get_engine().connect() as conn:
+        rows = conn.execute(text(_STRIKE_ASSET_QUERY))
+        return [_row_to_friendly_asset(row) for row in rows]
